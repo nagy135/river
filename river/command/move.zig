@@ -50,6 +50,24 @@ pub fn move(
     apply(view);
 }
 
+pub fn setPosition(
+    allocator: *std.mem.Allocator,
+    seat: *Seat,
+    args: []const [:0]const u8,
+    out: *?[]const u8,
+) Error!void {
+    if (args.len < 3) return Error.NotEnoughArguments;
+    if (args.len > 3) return Error.TooManyArguments;
+
+    const view = getView(seat) orelse return;
+    const x = try std.fmt.parseInt(i32, args[1], 10);
+    const y = try std.fmt.parseInt(i32, args[2], 10);
+
+    view.setPosition(x, y);
+
+    apply(view);
+}
+
 pub fn snap(
     allocator: *std.mem.Allocator,
     seat: *Seat,
@@ -131,6 +149,25 @@ pub fn resize(
             view.move(0, @divFloor(real_delta, 2));
         },
     }
+
+    apply(view);
+}
+
+pub fn setDimensions(
+    allocator: *std.mem.Allocator,
+    seat: *Seat,
+    args: []const [:0]const u8,
+    out: *?[]const u8,
+) Error!void {
+    if (args.len < 3) return Error.NotEnoughArguments;
+    if (args.len > 3) return Error.TooManyArguments;
+
+    const width = try std.fmt.parseInt(i32, args[1], 10);
+    const height = try std.fmt.parseInt(i32, args[2], 10);
+
+    const view = getView(seat) orelse return;
+    const border_width = @intCast(i32, server.config.border_width);
+    const output_box = view.output.getEffectiveResolution();
 
     apply(view);
 }

@@ -398,6 +398,11 @@ pub fn move(self: *Self, delta_x: i32, delta_y: i32) void {
     self.pending.box.y = math.max(self.pending.box.y, 0);
 }
 
+/// Modify the pending x/y with new absolute values, clamping to the bounds of the output
+pub fn setPosition(self: *Self, x: i32, y: i32) void {
+
+}
+
 /// Find and return the view corresponding to a given surface, if any
 pub fn fromWlrSurface(surface: *wlr.Surface) ?*Self {
     if (surface.isXdgSurface()) {
