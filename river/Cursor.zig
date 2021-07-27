@@ -20,6 +20,7 @@ const Self = @This();
 const build_options = @import("build_options");
 const std = @import("std");
 const assert = std.debug.assert;
+const os = std.os;
 const math = std.math;
 const wlr = @import("wlroots");
 const wayland = @import("wayland");
@@ -178,17 +179,13 @@ pub fn setTheme(self: *Self, theme: ?[*:0]const u8, _size: ?u32) !void {
     }
 }
 
-pub fn isCursorActionTarget(self: Self, view: *const View) bool {
-    return switch (self.mode) {
+pub fn handleViewUnmap(self: *Self, view: *View) void {
+    if (switch (self.mode) {
         .passthrough => false,
         .down => |target_view| target_view == view,
         .move => |target_view| target_view == view,
         .resize => |data| data.view == view,
-    };
-}
-
-pub fn handleViewUnmap(self: *Self, view: *View) void {
-    if (self.isCursorActionTarget(view)) {
+    }) {
         self.mode = .passthrough;
         self.clearFocus();
     }
@@ -231,32 +228,28 @@ fn handleButton(listener: *wl.Listener(*wlr.Pointer.event.Button), event: *wlr.P
         }
     }
 
-    var sx: f64 = undefined;
-    var sy: f64 = undefined;
-    if (self.surfaceAt(self.wlr_cursor.x, self.wlr_cursor.y, &sx, &sy)) |surface| {
-        // If the found surface is a keyboard inteactive layer surface,
-        // give it keyboard focus.
-        if (surface.isLayerSurface()) {
-            const wlr_layer_surface = wlr.LayerSurfaceV1.fromWlrSurface(surface);
-            if (wlr_layer_surface.current.keyboard_interactive == .exclusive) {
-                const layer_surface = @intToPtr(*LayerSurface, wlr_layer_surface.data);
-                self.seat.focusOutput(layer_surface.output);
-                self.seat.setFocusRaw(.{ .layer = layer_surface });
-            }
+    if (self.surfaceAt()) |result| {
+        switch (result.parent) {
+            .view => |view| {
+                // If a view has been clicked on, give that view keyboard focus and
+                // perhaps enter move/resize mode.
+                if (event.state == .pressed and self.pressed_count == 1) {
+                    // If there is an active mapping for this button which is
+                    // handled we are done here
+                    if (self.handlePointerMapping(event, view)) return;
+                    // Otherwise enter cursor down mode, giving keyboard focus
+                    self.enterMode(.down, view);
+                }
+            },
+            .layer_surface => |layer_surface| {
+                // If a keyboard inteactive layer surface has been clicked on,
+                // give it keyboard focus.
+                if (layer_surface.wlr_layer_surface.current.keyboard_interactive == .exclusive) {
+                    self.seat.focusOutput(layer_surface.output);
+                    self.seat.setFocusRaw(.{ .layer = layer_surface });
+                }
+            },
         }
-
-        // If the target surface has a view, give that view keyboard focus and
-        // perhaps enter move/resize mode.
-        if (View.fromWlrSurface(surface)) |view| {
-            if (event.state == .pressed and self.pressed_count == 1) {
-                // If there is an active mapping for this button which is
-                // handled we are done here
-                if (self.handlePointerMapping(event, view)) return;
-                // Otherwise enter cursor down mode
-                self.enterMode(.down, view);
-            }
-        }
-
         _ = self.seat.wlr_seat.pointerNotifyButton(event.time_msec, event.button, event.state);
     }
 }
@@ -420,11 +413,22 @@ fn handleRequestSetCursor(
     }
 }
 
-/// Find the topmost surface under the output layout coordinates lx/ly
-/// returns the surface if found and sets the sx/sy parameters to the
-/// surface coordinates.
+const SurfaceAtResult = struct {
+    surface: *wlr.Surface,
+    sx: f64,
+    sy: f64,
+    parent: union(enum) {
+        view: *View,
+        layer_surface: *LayerSurface,
+    },
+};
+
+/// Find the surface under the cursor if any, and return information about that
+/// surface and the cursor's position in surface local coords.
 /// This function must be kept in sync with the rendering order in render.zig.
-fn surfaceAt(self: Self, lx: f64, ly: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
+pub fn surfaceAt(self: Self) ?SurfaceAtResult {
+    const lx = self.wlr_cursor.x;
+    const ly = self.wlr_cursor.y;
     const wlr_output = server.root.output_layout.outputAt(lx, ly) orelse return null;
     const output = @intToPtr(*Output, wlr_output.data);
 
@@ -433,89 +437,183 @@ fn surfaceAt(self: Self, lx: f64, ly: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
     var oy = ly;
     server.root.output_layout.outputCoords(wlr_output, &ox, &oy);
 
+    // Find the first visible fullscreen view in the stack if there is one
+    var it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
+    const fullscreen_view = while (it.next()) |view| {
+        if (view.current.fullscreen) break view;
+    } else null;
+
     // Check surfaces in the reverse order they are rendered in:
-    // 1. overlay layer (+ popups)
-    // 2. top, bottom, background popups
-    // 3. top layer
-    // 4. views
-    // 5. bottom, background layers
-    if (layerSurfaceAt(output.getLayer(.overlay).*, ox, oy, sx, sy)) |s| return s;
+    //
+    // fullscreen:
+    //  1. overlay layer toplevels and popups
+    //  2. xwayland unmanaged stuff
+    //  3. fullscreen view toplevels and popups
+    //
+    // non-fullscreen:
+    //  1. overlay layer toplevels and popups
+    //  2. top, bottom, background layer popups
+    //  3. top layer toplevels
+    //  4. xwayland unmanaged stuff
+    //  5. view toplevels and popups
+    //  6. bottom, background layer toplevels
 
-    for ([_]zwlr.LayerShellV1.Layer{ .top, .bottom, .background }) |layer| {
-        if (layerPopupSurfaceAt(output.getLayer(layer).*, ox, oy, sx, sy)) |s| return s;
-    }
+    if (layerSurfaceAt(output.getLayer(.overlay).*, ox, oy)) |s| return s;
 
-    if (layerSurfaceAt(output.getLayer(.top).*, ox, oy, sx, sy)) |s| return s;
+    if (fullscreen_view) |view| {
+        //if (build_options.xwayland) if (xwaylandUnmanagedSurfaceAt(ly, lx)) |s| return s;
+        var sx: f64 = undefined;
+        var sy: f64 = undefined;
+        if (view.surfaceAt(ox, oy, &sx, &sy)) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .view = view },
+            };
+        }
+    } else {
+        for ([_]zwlr.LayerShellV1.Layer{ .top, .bottom, .background }) |layer| {
+            if (layerPopupSurfaceAt(output.getLayer(layer).*, ox, oy)) |s| return s;
+        }
 
-    if (viewSurfaceAt(output.*, ox, oy, sx, sy)) |s| return s;
+        if (layerSurfaceAt(output.getLayer(.top).*, ox, oy)) |s| return s;
 
-    for ([_]zwlr.LayerShellV1.Layer{ .bottom, .background }) |layer| {
-        if (layerSurfaceAt(output.getLayer(layer).*, ox, oy, sx, sy)) |s| return s;
+        //if (build_options.xwayland) if (xwaylandUnmanagedSurfaceAt(lx, ly)) |s| return s;
+
+        if (viewSurfaceAt(output, ox, oy)) |s| return s;
+
+        for ([_]zwlr.LayerShellV1.Layer{ .bottom, .background }) |layer| {
+            if (layerSurfaceAt(output.getLayer(layer).*, ox, oy)) |s| return s;
+        }
     }
 
     return null;
 }
 
 /// Find the topmost popup surface on the given layer at ox,oy.
-fn layerPopupSurfaceAt(layer: std.TailQueue(LayerSurface), ox: f64, oy: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
+fn layerPopupSurfaceAt(layer: std.TailQueue(LayerSurface), ox: f64, oy: f64) ?SurfaceAtResult {
     var it = layer.first;
     while (it) |node| : (it = node.next) {
         const layer_surface = &node.data;
+        var sx: f64 = undefined;
+        var sy: f64 = undefined;
         if (layer_surface.wlr_layer_surface.popupSurfaceAt(
             ox - @intToFloat(f64, layer_surface.box.x),
             oy - @intToFloat(f64, layer_surface.box.y),
-            sx,
-            sy,
-        )) |found| return found;
+            &sx,
+            &sy,
+        )) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .layer_surface = layer_surface },
+            };
+        }
     }
     return null;
 }
 
 /// Find the topmost surface (or popup surface) on the given layer at ox,oy.
-fn layerSurfaceAt(layer: std.TailQueue(LayerSurface), ox: f64, oy: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
+fn layerSurfaceAt(layer: std.TailQueue(LayerSurface), ox: f64, oy: f64) ?SurfaceAtResult {
     var it = layer.first;
     while (it) |node| : (it = node.next) {
         const layer_surface = &node.data;
+        var sx: f64 = undefined;
+        var sy: f64 = undefined;
         if (layer_surface.wlr_layer_surface.surfaceAt(
             ox - @intToFloat(f64, layer_surface.box.x),
             oy - @intToFloat(f64, layer_surface.box.y),
-            sx,
-            sy,
-        )) |found| return found;
+            &sx,
+            &sy,
+        )) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .layer_surface = layer_surface },
+            };
+        }
     }
     return null;
 }
 
 /// Find the topmost visible view surface (incl. popups) at ox,oy.
-fn viewSurfaceAt(output: Output, ox: f64, oy: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
+fn viewSurfaceAt(output: *const Output, ox: f64, oy: f64) ?SurfaceAtResult {
+    var sx: f64 = undefined;
+    var sy: f64 = undefined;
+
     // focused, floating views
     var it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
     while (it.next()) |view| {
         if (view.current.focus == 0 or !view.current.float) continue;
-        if (view.surfaceAt(ox, oy, sx, sy)) |found| return found;
+        if (view.surfaceAt(ox, oy, &sx, &sy)) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .view = view },
+            };
+        }
     }
 
     // non-focused, floating views
     it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
     while (it.next()) |view| {
         if (view.current.focus != 0 or !view.current.float) continue;
-        if (view.surfaceAt(ox, oy, sx, sy)) |found| return found;
+        if (view.surfaceAt(ox, oy, &sx, &sy)) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .view = view },
+            };
+        }
     }
 
     // focused, non-floating views
     it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
     while (it.next()) |view| {
         if (view.current.focus == 0 or view.current.float) continue;
-        if (view.surfaceAt(ox, oy, sx, sy)) |found| return found;
+        if (view.surfaceAt(ox, oy, &sx, &sy)) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .view = view },
+            };
+        }
     }
 
     // non-focused, non-floating views
     it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
     while (it.next()) |view| {
         if (view.current.focus != 0 or view.current.float) continue;
-        if (view.surfaceAt(ox, oy, sx, sy)) |found| return found;
+        if (view.surfaceAt(ox, oy, &sx, &sy)) |found| {
+            return SurfaceAtResult{
+                .surface = found,
+                .sx = sx,
+                .sy = sy,
+                .parent = .{ .view = view },
+            };
+        }
     }
 
+    return null;
+}
+
+fn xwaylandUnmanagedSurfaceAt(lx: f64, ly: f64) ?*wlr.Surface {
+    var it = server.root.xwayland_unmanaged_views.first;
+    while (it) |node| : (it = node.next) {
+        const xwayland_surface = node.data.xwayland_surface;
+        if (xwayland_surface.surface.?.surfaceAt(
+            lx - @intToFloat(f64, xwayland_surface.x),
+            ly - @intToFloat(f64, xwayland_surface.y),
+            sx,
+            sy,
+        )) |found| return found;
+    }
     return null;
 }
 
@@ -523,7 +621,6 @@ fn surfaceAtFilter(view: *View, filter_tags: u32) bool {
     return !view.destroying and view.current.tags & filter_tags != 0;
 }
 
-/// Enter move or resize mode
 pub fn enterMode(self: *Self, mode: std.meta.Tag((Mode)), view: *View) void {
     log.debug("enter {s} cursor mode", .{@tagName(mode)});
 
@@ -608,12 +705,12 @@ fn processMotion(self: *Self, device: *wlr.InputDevice, time: u32, delta_x: f64,
         if (self.mode == .passthrough or self.mode == .down) {
             if (constraint.type == .locked) return;
 
-            var sx: f64 = undefined;
-            var sy: f64 = undefined;
-            const surface = self.surfaceAt(self.wlr_cursor.x, self.wlr_cursor.y, &sx, &sy);
+            const result = self.surfaceAt() orelse return;
 
-            if (surface != constraint.surface) return;
+            if (result.surface != constraint.surface) return;
 
+            const sx = result.sx;
+            const sy = result.sy;
             var sx_con: f64 = undefined;
             var sy_con: f64 = undefined;
             if (!wlr.region.confine(&constraint.region, sx, sy, sx + dx, sy + dy, &sx_con, &sy_con)) {
@@ -674,29 +771,66 @@ fn processMotion(self: *Self, device: *wlr.InputDevice, time: u32, delta_x: f64,
     }
 }
 
+/// Handle potential change in location of views on the output, as well as
+/// the target view of a cursor operation potentially being moved to a non-visible tag,
+/// becoming fullscreen, etc.
+pub fn updateState(self: *Self) void {
+    if (self.shouldPassthrough()) {
+        self.mode = .passthrough;
+        var now: os.timespec = undefined;
+        os.clock_gettime(os.CLOCK_MONOTONIC, &now) catch @panic("CLOCK_MONOTONIC not supported");
+        const msec = @intCast(u32, now.tv_sec * std.time.ms_per_s +
+            @divFloor(now.tv_nsec, std.time.ns_per_ms));
+        self.passthrough(msec);
+    }
+}
+
+fn shouldPassthrough(self: Self) bool {
+    switch (self.mode) {
+        .passthrough => {
+            // If we are not currently in down/resize/move mode, we *always* need to passthrough()
+            // as what is under the cursor may have changed and we are not locked to a single
+            // target view.
+            return true;
+        },
+        .down => |target| {
+            // The target view is no longer visible
+            return target.current.tags & target.output.current.tags == 0;
+        },
+        .resize, .move => {
+            const target = if (self.mode == .resize) self.mode.resize.view else self.mode.move;
+            // The target view is no longer visible, is part of the layout, or is fullscreen.
+            return target.current.tags & target.output.current.tags == 0 or
+                (!target.current.float and target.output.current.layout != null) or
+                target.current.fullscreen;
+        },
+    }
+}
+
 /// Pass an event on to the surface under the cursor, if any.
 fn passthrough(self: *Self, time: u32) void {
     assert(self.mode == .passthrough);
 
-    var sx: f64 = undefined;
-    var sy: f64 = undefined;
-    if (self.surfaceAt(self.wlr_cursor.x, self.wlr_cursor.y, &sx, &sy)) |surface| {
+    if (self.surfaceAt()) |result| {
         // If input is allowed on the surface, send pointer enter and motion
         // events. Note that wlroots won't actually send an enter event if
         // the surface has already been entered.
-        if (server.input_manager.inputAllowed(surface)) {
+        if (server.input_manager.inputAllowed(result.surface)) {
             // The focus change must be checked before sending enter events
-            const focus_change = self.seat.wlr_seat.pointer_state.focused_surface != surface;
+            const focus_change = self.seat.wlr_seat.pointer_state.focused_surface != result.surface;
 
-            self.seat.wlr_seat.pointerNotifyEnter(surface, sx, sy);
-            self.seat.wlr_seat.pointerNotifyMotion(time, sx, sy);
+            self.seat.wlr_seat.pointerNotifyEnter(result.surface, result.sx, result.sy);
+            self.seat.wlr_seat.pointerNotifyMotion(time, result.sx, result.sy);
 
             const follow_mode = server.config.focus_follows_cursor;
             if (follow_mode == .strict or (follow_mode == .normal and focus_change)) {
-                if (View.fromWlrSurface(surface)) |view| {
-                    self.seat.focusOutput(view.output);
-                    self.seat.focus(view);
-                    server.root.startTransaction();
+                switch (result.parent) {
+                    .view => |view| {
+                        self.seat.focusOutput(view.output);
+                        self.seat.focus(view);
+                        server.root.startTransaction();
+                    },
+                    .layer_surface => {},
                 }
             }
         }

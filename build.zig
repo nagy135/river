@@ -6,6 +6,12 @@ const zbs = std.build;
 
 const ScanProtocolsStep = @import("deps/zig-wayland/build.zig").ScanProtocolsStep;
 
+/// While a river release is in development, this string should contain the version in development
+/// with the "-dev" suffix.
+/// When a release is tagged, the "-dev" suffix should be removed for the commit that gets tagged.
+/// Directly after the tagged commit, the version should be bumped and the "-dev" suffix added.
+const version = "0.1.0-dev";
+
 pub fn build(b: *zbs.Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
@@ -46,15 +52,20 @@ pub fn build(b: *zbs.Builder) !void {
         "Set to true to install fish completion for riverctl. Defaults to true.",
     ) orelse true;
 
-    const examples = b.option(bool, "examples", "Set to true to build examples") orelse false;
-
-    const rel_config_path = if (mem.eql(u8, try fs.path.resolve(b.allocator, &[_][]const u8{b.install_prefix}), "/usr"))
-        "../etc/river/init"
-    else
-        "etc/river/init";
-    b.installFile("example/init", rel_config_path);
-    const abs_config_path = try fs.path.resolve(b.allocator, &[_][]const u8{ b.install_prefix, rel_config_path });
-    assert(fs.path.isAbsolute(abs_config_path));
+    const full_version = blk: {
+        if (mem.endsWith(u8, version, "-dev")) {
+            var ret: u8 = undefined;
+            const git_dir = try fs.path.join(b.allocator, &[_][]const u8{ b.build_root, ".git" });
+            const git_commit_hash = b.execAllowFail(
+                &[_][]const u8{ "git", "--git-dir", git_dir, "--work-tree", b.build_root, "rev-parse", "--short", "HEAD" },
+                &ret,
+                .Inherit,
+            ) catch break :blk version;
+            break :blk try std.fmt.allocPrintZ(b.allocator, "{s}-{s}", .{ version, git_commit_hash });
+        } else {
+            break :blk version;
+        }
+    };
 
     const scanner = ScanProtocolsStep.create(b);
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -63,7 +74,7 @@ pub fn build(b: *zbs.Builder) !void {
     scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
     scanner.addProtocolPath("protocol/river-control-unstable-v1.xml");
     scanner.addProtocolPath("protocol/river-status-unstable-v1.xml");
-    scanner.addProtocolPath("protocol/river-layout-v2.xml");
+    scanner.addProtocolPath("protocol/river-layout-v3.xml");
     scanner.addProtocolPath("protocol/wlr-layer-shell-unstable-v1.xml");
     scanner.addProtocolPath("protocol/wlr-output-power-management-unstable-v1.xml");
 
@@ -72,7 +83,7 @@ pub fn build(b: *zbs.Builder) !void {
         river.setTarget(target);
         river.setBuildMode(mode);
         river.addBuildOption(bool, "xwayland", xwayland);
-        river.addBuildOption([]const u8, "default_config_path", abs_config_path);
+        river.addBuildOption([:0]const u8, "version", full_version);
 
         addServerDeps(river, scanner);
 
@@ -83,9 +94,11 @@ pub fn build(b: *zbs.Builder) !void {
         const riverctl = b.addExecutable("riverctl", "riverctl/main.zig");
         riverctl.setTarget(target);
         riverctl.setBuildMode(mode);
+        riverctl.addBuildOption([:0]const u8, "version", full_version);
 
         riverctl.step.dependOn(&scanner.step);
         riverctl.addPackage(scanner.getPkg());
+        riverctl.addPackagePath("flags", "common/flags.zig");
         riverctl.linkLibC();
         riverctl.linkSystemLibrary("wayland-client");
 
@@ -98,9 +111,11 @@ pub fn build(b: *zbs.Builder) !void {
         const rivertile = b.addExecutable("rivertile", "rivertile/main.zig");
         rivertile.setTarget(target);
         rivertile.setBuildMode(mode);
+        rivertile.addBuildOption([:0]const u8, "version", full_version);
 
         rivertile.step.dependOn(&scanner.step);
         rivertile.addPackage(scanner.getPkg());
+        rivertile.addPackagePath("flags", "common/flags.zig");
         rivertile.linkLibC();
         rivertile.linkSystemLibrary("wayland-client");
 
@@ -109,47 +124,23 @@ pub fn build(b: *zbs.Builder) !void {
         rivertile.install();
     }
 
+    b.installFile("protocol/river-layout-v3.xml", "share/river/river-layout-v3.xml");
+
     if (man_pages) {
         const scdoc_step = ScdocStep.create(b);
         try scdoc_step.install();
     }
 
     if (bash_completion) {
-        b.installFile(
-            "completions/bash/riverctl",
-            "share/bash-completion/completions/riverctl",
-        );
+        b.installFile("completions/bash/riverctl", "share/bash-completion/completions/riverctl");
     }
 
     if (zsh_completion) {
-        b.installFile(
-            "completions/zsh/_riverctl",
-            "share/zsh/site-functions/_riverctl",
-        );
+        b.installFile("completions/zsh/_riverctl", "share/zsh/site-functions/_riverctl");
     }
 
     if (fish_completion) {
-        b.installFile(
-            "completions/fish/riverctl.fish",
-            "share/fish/vendor_completions.d/riverctl.fish",
-        );
-    }
-
-    if (examples) {
-        inline for (.{"status"}) |example_name| {
-            const example = b.addExecutable(example_name, "example/" ++ example_name ++ ".zig");
-            example.setTarget(target);
-            example.setBuildMode(mode);
-
-            example.step.dependOn(&scanner.step);
-            example.addPackage(scanner.getPkg());
-            example.linkLibC();
-            example.linkSystemLibrary("wayland-client");
-
-            scanner.addCSource(example);
-
-            example.install();
-        }
+        b.installFile("completions/fish/riverctl.fish", "share/fish/vendor_completions.d/riverctl.fish");
     }
 
     {
@@ -192,6 +183,9 @@ fn addServerDeps(exe: *zbs.LibExeObjStep, scanner: *ScanProtocolsStep) void {
 
     exe.addPackage(wlroots);
     exe.linkSystemLibrary("wlroots");
+
+    exe.addPackagePath("flags", "common/flags.zig");
+    exe.addCSourceFile("river/wlroots_log_wrapper.c", &[_][]const u8{ "-std=c99", "-O2" });
 
     // TODO: remove when zig issue #131 is implemented
     scanner.addCSource(exe);

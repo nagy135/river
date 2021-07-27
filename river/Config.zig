@@ -48,7 +48,7 @@ border_width: u32 = 2,
 border_color_focused: [4]f32 = [_]f32{ 0.57647059, 0.63137255, 0.63137255, 1.0 }, // Solarized base1
 
 /// Color of border of unfocused window in RGBA
-border_color_unfocused: [4]f32 = [_]f32{ 0.34509804, 0.43137255, 0.45882353, 1.0 }, // Solarized base0
+border_color_unfocused: [4]f32 = [_]f32{ 0.34509804, 0.43137255, 0.45882353, 1.0 }, // Solarized base01
 
 /// Map of keymap mode name to mode id
 mode_to_id: std.StringHashMap(usize),
@@ -75,19 +75,6 @@ default_layout_namespace: []const u8 = &[0]u8{},
 
 /// Determines where new views will be attached to the view stack.
 attach_mode: AttachMode = .top,
-
-opacity: struct {
-    /// The opacity of focused views
-    focused: f32 = 1.0,
-    /// The opacity of unfocused views
-    unfocused: f32 = 1.0,
-    /// The initial opacity of new views
-    initial: f32 = 1.0,
-    /// View opacity transition step
-    delta: f32 = 1.0,
-    /// Time between view opacity transition steps in milliseconds
-    delta_t: u31 = 20,
-} = .{},
 
 /// Keyboard repeat rate in characters per second
 repeat_rate: u31 = 25,

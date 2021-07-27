@@ -6,12 +6,20 @@ riverctl - command-line interface for controlling river
 
 # SYNOPSIS
 
-*riverctl* _command_ [_command specific arguments_]
+*riverctl* [_options_] _command_ [_command specific arguments_]
 
 # DESCRIPTION
 
 *riverctl* is a command-line utility used to control and configure river
 over the Wayland protocol.
+
+# OPTIONS
+
+*-help*
+	Print a help message and exit.
+
+*-version*
+	Print the version number and exit.
 
 # COMMANDS
 
@@ -65,9 +73,9 @@ over the Wayland protocol.
 	output in any direction.
 
 *spawn* _shell_command_
-	Run _shell_command_ using _/bin/sh -c_. Put single quotes around
-	_shell_command_ if you do not want special characters to get
-	interpreted by your shell before the command gets passed to _/bin/sh_.
+	Run _shell_command_ using `/bin/sh -c _shell_command_`. Note that
+	*spawn* only takes a single argument. To spawn a command taking
+	multiple arguments, wrapping the command in quotes is recommended.
 
 *swap* *next*|*previous*
 	Swap the focused view with the next/previous visible non-floating
@@ -90,15 +98,11 @@ over the Wayland protocol.
 	Set the layout namespace of currently focused output, overriding
 	the value set with *default-layout* if any.
 
-*set-layout-value* _namespace_ _type_ _name_ _value_
-	Set the value with name _name_ of the layout on the focused output
-	with matching namespace. If there is no matching layout, this command
-	does nothing.
-
-*mod-layout-value* _namespace_ _type_ _name_ _value_
-	Modify the value with name _name_ of the layout on the focused
-	output with matching namespace. If there is no matching layout,
-	this command does nothing.
+*send-layout-cmd* _namespace_ _command_
+	Send _command_ to the layout client on the currently focused output
+	with the given _namespace_, if any. What commands a layout client
+	understands depends on the layout client. For rivertile, see the
+	documentation in the *rivertile*(1) man page.
 
 ## TAG MANAGEMENT
 
@@ -226,13 +230,13 @@ A complete list may be found in _/usr/include/linux/input-event-codes.h_
 *attach-mode* *top*|*bottom*
 	Configure where new views should attach to the view stack.
 
-*background-color* _#RRGGBB_|_#RRGGBBAA_
+*background-color* _0xRRGGBB_|_0xRRGGBBAA_
 	Set the background color.
 
-*border-color-focused* _#RRGGBB_|_#RRGGBBAA_
+*border-color-focused* _0xRRGGBB_|_0xRRGGBBAA_
 	Set the border color of focused views.
 
-*border-color-unfocused* _#RRGGBB_|_#RRGGBBAA_
+*border-color-unfocused* _0xRRGGBB_|_0xRRGGBBAA_
 	Set the border color of unfocused views.
 
 *border-width* _pixels_
@@ -258,26 +262,6 @@ A complete list may be found in _/usr/include/linux/input-event-codes.h_
 	- _disabled_: Cursor will not be warped. This is the default.
 	- _on-output-change_: When a different output is focused, the cursor will be
 	  warped to its center.
-
-*opacity* _focused_ _unfocused_ _initial_ _step-size_ _delta-t_
-	Configure server-side opacity of views, including transition
-	animations. A value of 0.0 is fully transparent while 1.0 is fully
-	opaque. By default all views are fully opaque and there are no
-	animations.
-
-	- _focused_: opacity of focused views [0.0, 1.0]
-	- _unfocused_: opacity of unfocused views [0.0, 1.0]
-	- _initial_: opacity of views when they are created before immediately
-	  transitioning to either _focused_ or _unfocused_ [0.0, 1.0]
-	- _step-size_: opacity change per step [0.05, 1.0]
-	- _delta-t_: step time in milliseconds
-
-	A transition animation may occur when changing between states with
-	different opacity values configured. Instead of setting the view's
-	opacity to the value for the new state immediately, it is changed
-	incrementally in steps of _step-size_ every _delta-t_ milliseconds.
-	Setting _step-size_ to 1.0 disables transitions fully regardless of
-	the value of _delta-t_.
 
 *set-repeat* _rate_ _delay_
 	Set the keyboard repeat rate to _rate_ key repeats per second and
@@ -360,9 +344,9 @@ However note that not every input device supports every property.
 
 # EXAMPLES
 
-Bind bemenu-run to Super+P in normal mode:
+Bind Super+Enter in normal mode to spawn a *foot*(1) terminal:
 
-	riverctl map normal Mod4 P spawn bemenu-run
+	riverctl map normal Mod4 Enter spawn 'foot --app-id=foobar'
 
 See also the example init script at /etc/river/init.
 

@@ -15,80 +15,83 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+const build_options = @import("build_options");
 const std = @import("std");
+const fs = std.fs;
+const io = std.io;
 const os = std.os;
 const wlr = @import("wlroots");
-
-const build_options = @import("build_options");
+const flags = @import("flags");
 
 const c = @import("c.zig");
 const util = @import("util.zig");
 
 const Server = @import("Server.zig");
 
-pub var server: Server = undefined;
-
-pub var level: std.log.Level = switch (std.builtin.mode) {
-    .Debug => .debug,
-    .ReleaseSafe => .notice,
-    .ReleaseFast => .err,
-    .ReleaseSmall => .emerg,
-};
-
 const usage: []const u8 =
-    \\Usage: river [options]
+    \\usage: river [options]
     \\
-    \\  -h            Print this help message and exit.
-    \\  -c <command>  Run `sh -c <command>` on startup.
-    \\  -l <level>    Set the log level to a value from 0 to 7.
+    \\  -help              Print this help message and exit.
+    \\  -version           Print the version number and exit.
+    \\  -c <command>       Run `sh -c <command>` on startup.
+    \\  -log-level <level> Set the log level to error, warning, info, or debug.
     \\
 ;
 
+pub var server: Server = undefined;
+
 pub fn main() anyerror!void {
-    var startup_command: ?[:0]const u8 = null;
-    {
-        var it = std.process.args();
-        // Skip our name
-        _ = it.nextPosix();
-        while (it.nextPosix()) |arg| {
-            if (std.mem.eql(u8, arg, "-h")) {
-                const stdout = std.io.getStdOut().writer();
-                try stdout.print(usage, .{});
-                os.exit(0);
-            } else if (std.mem.eql(u8, arg, "-c")) {
-                if (it.nextPosix()) |command| {
-                    // If the user used '-c' multiple times the variable
-                    // already holds a path and needs to be freed.
-                    if (startup_command) |cmd| util.gpa.free(cmd);
-                    startup_command = try util.gpa.dupeZ(u8, command);
-                } else {
-                    printErrorExit("Error: flag '-c' requires exactly one argument", .{});
-                }
-            } else if (std.mem.eql(u8, arg, "-l")) {
-                if (it.nextPosix()) |level_str| {
-                    const log_level = std.fmt.parseInt(u3, level_str, 10) catch
-                        printErrorExit("Error: invalid log level '{s}'", .{level_str});
-                    level = @intToEnum(std.log.Level, log_level);
-                } else {
-                    printErrorExit("Error: flag '-l' requires exactly one argument", .{});
-                }
-            } else {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print(usage, .{});
-                os.exit(1);
-            }
-        }
+    // This line is here because of https://github.com/ziglang/zig/issues/7807
+    const argv: [][*:0]const u8 = os.argv;
+    const result = flags.parse(argv[1..], &[_]flags.Flag{
+        .{ .name = "-help", .kind = .boolean },
+        .{ .name = "-version", .kind = .boolean },
+        .{ .name = "-c", .kind = .arg },
+        .{ .name = "-log-level", .kind = .arg },
+    }) catch {
+        try io.getStdErr().writeAll(usage);
+        os.exit(1);
+    };
+    if (result.boolFlag("-help")) {
+        try io.getStdOut().writeAll(usage);
+        os.exit(0);
+    }
+    if (result.args.len != 0) {
+        std.log.err("unknown option '{s}'", .{result.args[0]});
+        try io.getStdErr().writeAll(usage);
+        os.exit(1);
     }
 
-    wlr.log.init(switch (level) {
+    if (result.boolFlag("-version")) {
+        try io.getStdOut().writeAll(build_options.version);
+        os.exit(0);
+    }
+    if (result.argFlag("-log-level")) |level_str| {
+        const level = std.meta.stringToEnum(LogLevel, std.mem.span(level_str)) orelse {
+            std.log.err("invalid log level '{s}'", .{level_str});
+            try io.getStdErr().writeAll(usage);
+            os.exit(1);
+        };
+        runtime_log_level = switch (level) {
+            .@"error" => .err,
+            .warning => .warn,
+            .info => .info,
+            .debug => .debug,
+        };
+    }
+    const startup_command = blk: {
+        if (result.argFlag("-c")) |command| {
+            break :blk try util.gpa.dupeZ(u8, std.mem.span(command));
+        } else {
+            break :blk try defaultInitPath();
+        }
+    };
+
+    river_init_wlroots_log(switch (runtime_log_level) {
         .debug => .debug,
         .notice, .info => .info,
         .warn, .err, .crit, .alert, .emerg => .err,
     });
-
-    if (startup_command == null) {
-        if (try getStartupCommand()) |path| startup_command = path;
-    }
 
     std.log.info("initializing server", .{});
     try server.init();
@@ -99,7 +102,7 @@ pub fn main() anyerror!void {
     // Run the child in a new process group so that we can send SIGTERM to all
     // descendants on exit.
     const child_pgid = if (startup_command) |cmd| blk: {
-        std.log.info("running startup command '{s}'", .{cmd});
+        std.log.info("running init executable '{s}'", .{cmd});
         const child_args = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd, null };
         const pid = try os.fork();
         if (pid == 0) {
@@ -111,8 +114,9 @@ pub fn main() anyerror!void {
         // Since the child has called setsid, the pid is the pgid
         break :blk pid;
     } else null;
-    defer if (child_pgid) |pgid|
-        os.kill(-pgid, os.SIGTERM) catch |e| std.log.err("failed to kill startup process: {s}", .{e});
+    defer if (child_pgid) |pgid| os.kill(-pgid, os.SIGTERM) catch |err| {
+        std.log.err("failed to kill init process group: {s}", .{@errorName(err)});
+    };
 
     std.log.info("running server", .{});
 
@@ -121,49 +125,70 @@ pub fn main() anyerror!void {
     std.log.info("shutting down", .{});
 }
 
-fn printErrorExit(comptime format: []const u8, args: anytype) noreturn {
-    const stderr = std.io.getStdErr().writer();
-    stderr.print(format ++ "\n", args) catch os.exit(1);
-    os.exit(1);
-}
+fn defaultInitPath() !?[:0]const u8 {
+    const path = blk: {
+        if (os.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
+            break :blk try fs.path.joinZ(util.gpa, &[_][]const u8{ xdg_config_home, "river/init" });
+        } else if (os.getenv("HOME")) |home| {
+            break :blk try fs.path.joinZ(util.gpa, &[_][]const u8{ home, ".config/river/init" });
+        } else {
+            return null;
+        }
+    };
 
-fn testConfigPath(comptime fmt: []const u8, args: anytype) std.fmt.AllocPrintError!?[:0]const u8 {
-    const path = try std.fmt.allocPrintZ(util.gpa, fmt, args);
-    os.access(path, os.X_OK) catch {
+    os.accessZ(path, os.X_OK) catch |err| {
+        std.log.err("failed to run init executable {s}: {s}", .{ path, @errorName(err) });
         util.gpa.free(path);
         return null;
     };
+
     return path;
 }
 
-fn getStartupCommand() std.fmt.AllocPrintError!?[:0]const u8 {
-    if (os.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
-        if (try testConfigPath("{s}/river/init", .{xdg_config_home})) |path| {
-            return path;
-        }
-    } else if (os.getenv("HOME")) |home| {
-        if (try testConfigPath("{s}/.config/river/init", .{home})) |path| {
-            return path;
-        }
-    }
-    if (try testConfigPath(build_options.default_config_path, .{})) |path| {
-        return path;
-    }
-    return null;
-}
+/// Tell std.log to leave all log level filtering to us.
+pub const log_level: std.log.Level = .debug;
+
+/// Set the default log level based on the build mode.
+var runtime_log_level: std.log.Level = switch (std.builtin.mode) {
+    .Debug => .debug,
+    .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .info,
+};
+
+/// River only exposes these 4 log levels to the user for simplicity
+const LogLevel = enum {
+    @"error",
+    warning,
+    info,
+    debug,
+};
 
 pub fn log(
     comptime message_level: std.log.Level,
-    comptime scope: @TypeOf(.foobar),
+    comptime scope: @TypeOf(.EnumLiteral),
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@enumToInt(message_level) <= @enumToInt(level)) {
-        // Don't store/log messages in release small mode to save space
-        if (std.builtin.mode != .ReleaseSmall) {
-            const stderr = std.io.getStdErr().writer();
-            stderr.print(@tagName(message_level) ++ ": (" ++ @tagName(scope) ++ ") " ++
-                format ++ "\n", args) catch return;
-        }
+    if (@enumToInt(message_level) > @enumToInt(runtime_log_level)) return;
+
+    const river_level: LogLevel = switch (message_level) {
+        .emerg, .alert, .crit, .err => .@"error",
+        .warn => .warning,
+        .notice, .info => .info,
+        .debug => .debug,
+    };
+    const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+
+    const stderr = std.io.getStdErr().writer();
+    stderr.print(@tagName(river_level) ++ scope_prefix ++ format ++ "\n", args) catch {};
+}
+
+/// See wlroots_log_wrapper.c
+extern fn river_init_wlroots_log(importance: wlr.log.Importance) void;
+export fn river_wlroots_log_callback(importance: wlr.log.Importance, ptr: [*:0]const u8, len: usize) void {
+    switch (importance) {
+        .err => log(.err, .wlroots, "{s}", .{ptr[0..len]}),
+        .info => log(.info, .wlroots, "{s}", .{ptr[0..len]}),
+        .debug => log(.debug, .wlroots, "{s}", .{ptr[0..len]}),
+        .silent, .last => unreachable,
     }
 }

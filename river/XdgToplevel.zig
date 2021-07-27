@@ -124,15 +124,6 @@ pub fn setResizing(self: Self, resizing: bool) void {
     _ = self.xdg_surface.role_data.toplevel.setResizing(resizing);
 }
 
-pub inline fn forEachPopupSurface(
-    self: Self,
-    comptime T: type,
-    iterator: fn (surface: *wlr.Surface, sx: c_int, sy: c_int, data: T) callconv(.C) void,
-    user_data: T,
-) void {
-    self.xdg_surface.forEachPopupSurface(T, iterator, user_data);
-}
-
 /// Return the surface at output coordinates ox, oy and set sx, sy to the
 /// corresponding surface-relative coordinates, if there is a surface.
 pub fn surfaceAt(self: Self, ox: f64, oy: f64, sx: *f64, sy: *f64) ?*wlr.Surface {
@@ -280,9 +271,14 @@ fn handleCommit(listener: *wl.Listener(*wlr.Surface), surface: *wlr.Surface) voi
             } else {
                 const self_tags_changed = view.pending.tags != view.current.tags;
                 view.current = view.pending;
-                view.commitOpacityTransition();
                 if (self_tags_changed) view.output.sendViewTags();
+
+                // This is necessary if this view was part of a transaction that didn't get completed
+                // before some change occured that caused shouldTrackConfigure() to return false.
+                view.dropSavedBuffers();
+
                 view.output.damage.addWhole();
+                server.input_manager.updateCursorState();
             }
         } else {
             // If the client has not yet acked our configure, we need to send a

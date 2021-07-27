@@ -178,11 +178,9 @@ pub fn inputAllowed(self: Self, wlr_surface: *wlr.Surface) bool {
         true;
 }
 
-pub fn isCursorActionTarget(self: Self, view: *View) bool {
+pub fn updateCursorState(self: Self) void {
     var it = self.seats.first;
-    return while (it) |node| : (it = node.next) {
-        if (node.data.cursor.isCursorActionTarget(view)) break true;
-    } else false;
+    while (it) |node| : (it = node.next) node.data.cursor.updateState();
 }
 
 fn handleInhibitActivate(

@@ -43,8 +43,6 @@ const SurfaceRenderData = struct {
     output_y: i32,
 
     when: *os.timespec,
-
-    opacity: f32,
 };
 
 /// The rendering order in this function must be kept in sync with Cursor.surfaceAt()
@@ -82,7 +80,6 @@ pub fn renderOutput(output: *Output) void {
         renderer.clear(&[_]f32{ 0, 0, 0, 1 });
         renderView(output, view, &now);
         if (build_options.xwayland) renderXwaylandUnmanaged(output, &now);
-        if (!view.destroying) renderViewPopups(output, view, &now);
     } else {
         // No fullscreen view, so render normal layers/views
         renderer.clear(&server.config.background_color);
@@ -127,13 +124,6 @@ pub fn renderOutput(output: *Output) void {
         if (build_options.xwayland) renderXwaylandUnmanaged(output, &now);
 
         renderLayer(output, output.getLayer(.top).*, &now, .toplevels);
-
-        // Render popups of focused views
-        it = ViewStack(View).iter(output.views.last, .reverse, output.current.tags, renderFilter);
-        while (it.next()) |view| {
-            if (view.current.focus == 0 or view.destroying) continue;
-            renderViewPopups(output, view, &now);
-        }
 
         renderLayer(output, output.getLayer(.background).*, &now, .popups);
         renderLayer(output, output.getLayer(.bottom).*, &now, .popups);
@@ -186,7 +176,6 @@ fn renderLayer(
             .output_x = layer_surface.box.x,
             .output_y = layer_surface.box.y,
             .when = now,
-            .opacity = 1.0,
         };
         switch (role) {
             .toplevels => layer_surface.wlr_layer_surface.surface.forEachSurface(
@@ -203,6 +192,7 @@ fn renderLayer(
     }
 }
 
+/// Render all surfaces in the view's surface tree, including subsurfaces and popups
 fn renderView(output: *const Output, view: *View, now: *os.timespec) void {
     // If we have saved buffers, we are in the middle of a transaction
     // and need to render those buffers until the transaction is complete.
@@ -218,32 +208,19 @@ fn renderView(output: *const Output, view: *View, now: *os.timespec) void {
                     .height = @intCast(c_int, saved_buffer.box.height),
                 },
                 saved_buffer.transform,
-                view.opacity,
             );
     } else {
-        // Since there is no stashed buffer, we are not in the middle of
-        // a transaction and may simply render each toplevel surface.
+        // Since there are no stashed buffers, we are not in the middle of
+        // a transaction and may simply render the most recent buffers provided
+        // by the client.
         var rdata = SurfaceRenderData{
             .output = output,
             .output_x = view.current.box.x - view.surface_box.x,
             .output_y = view.current.box.y - view.surface_box.y,
             .when = now,
-            .opacity = view.opacity,
         };
-
-        view.surface.?.forEachSurface(*SurfaceRenderData, renderSurfaceIterator, &rdata);
+        view.forEachSurface(*SurfaceRenderData, renderSurfaceIterator, &rdata);
     }
-}
-
-fn renderViewPopups(output: *const Output, view: *View, now: *os.timespec) void {
-    var rdata = SurfaceRenderData{
-        .output = output,
-        .output_x = view.current.box.x - view.surface_box.x,
-        .output_y = view.current.box.y - view.surface_box.y,
-        .when = now,
-        .opacity = view.opacity,
-    };
-    view.forEachPopupSurface(*SurfaceRenderData, renderSurfaceIterator, &rdata);
 }
 
 fn renderDragIcons(output: *const Output, now: *os.timespec) void {
@@ -260,7 +237,6 @@ fn renderDragIcons(output: *const Output, now: *os.timespec) void {
             .output_y = @floatToInt(i32, drag_icon.seat.cursor.wlr_cursor.y) +
                 drag_icon.wlr_drag_icon.surface.sy - output_box.y,
             .when = now,
-            .opacity = 1.0,
         };
         drag_icon.wlr_drag_icon.surface.forEachSurface(*SurfaceRenderData, renderSurfaceIterator, &rdata);
     }
@@ -270,8 +246,8 @@ fn renderDragIcons(output: *const Output, now: *os.timespec) void {
 fn renderXwaylandUnmanaged(output: *const Output, now: *os.timespec) void {
     const output_box = server.root.output_layout.getBox(output.wlr_output).?;
 
-    var it = server.root.xwayland_unmanaged_views.first;
-    while (it) |node| : (it = node.next) {
+    var it = server.root.xwayland_unmanaged_views.last;
+    while (it) |node| : (it = node.prev) {
         const xwayland_surface = node.data.xwayland_surface;
 
         var rdata = SurfaceRenderData{
@@ -279,7 +255,6 @@ fn renderXwaylandUnmanaged(output: *const Output, now: *os.timespec) void {
             .output_x = xwayland_surface.x - output_box.x,
             .output_y = xwayland_surface.y - output_box.y,
             .when = now,
-            .opacity = 1.0,
         };
         xwayland_surface.surface.?.forEachSurface(*SurfaceRenderData, renderSurfaceIterator, &rdata);
     }
@@ -302,7 +277,6 @@ fn renderSurfaceIterator(
             .height = surface.current.height,
         },
         surface.current.transform,
-        rdata.opacity,
     );
 
     surface.sendFrameDone(rdata.when);
@@ -315,7 +289,6 @@ fn renderTexture(
     texture: *wlr.Texture,
     wlr_box: wlr.Box,
     transform: wl.Output.Transform,
-    opacity: f32,
 ) void {
     var box = wlr_box;
 
@@ -333,7 +306,7 @@ fn renderTexture(
     // This takes our matrix, the texture, and an alpha, and performs the actual
     // rendering on the GPU.
     const renderer = output.wlr_output.backend.getRenderer().?;
-    renderer.renderTextureWithMatrix(texture, &matrix, opacity) catch return;
+    renderer.renderTextureWithMatrix(texture, &matrix, 1.0) catch return;
 }
 
 fn renderBorders(output: *const Output, view: *View, now: *os.timespec) void {

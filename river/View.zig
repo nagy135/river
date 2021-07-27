@@ -71,9 +71,6 @@ const State = struct {
 
     float: bool = false,
     fullscreen: bool = false,
-
-    /// Opacity the view is transitioning to
-    target_opacity: f32,
 };
 
 const SavedBuffer = struct {
@@ -118,17 +115,9 @@ saved_buffers: std.ArrayList(SavedBuffer),
 /// view returns to floating mode.
 float_box: Box = undefined,
 
-/// While a view is in fullscreen, it is still arranged if a layout is active but
-/// the resulting dimensions are stored here instead of being applied to the view's
-/// state. This allows us to avoid an arrange when the view returns from fullscreen
-/// and for more intuitive behavior if there is no active layout for the output.
+/// This state exists purely to allow for more intuitive behavior when
+/// exiting fullscreen if there is no active layout.
 post_fullscreen_box: Box = undefined,
-
-/// The current opacity of this view
-opacity: f32,
-
-/// Opacity change timer event source
-opacity_timer: ?*wl.EventSource = null,
 
 draw_borders: bool = true,
 
@@ -144,16 +133,9 @@ foreign_close: wl.Listener(*wlr.ForeignToplevelHandleV1) =
 pub fn init(self: *Self, output: *Output, tags: u32, surface: anytype) void {
     self.* = .{
         .output = output,
-        .current = .{
-            .tags = tags,
-            .target_opacity = server.config.opacity.initial,
-        },
-        .pending = .{
-            .tags = tags,
-            .target_opacity = server.config.opacity.initial,
-        },
+        .current = .{ .tags = tags },
+        .pending = .{ .tags = tags },
         .saved_buffers = std.ArrayList(SavedBuffer).init(util.gpa),
-        .opacity = server.config.opacity.initial,
     };
 
     if (@TypeOf(surface) == *wlr.XdgSurface) {
@@ -191,47 +173,40 @@ pub fn destroy(self: *Self) void {
 pub fn applyPending(self: *Self) void {
     var arrange_output = false;
 
-    if (self.current.tags != self.pending.tags)
-        arrange_output = true;
+    if (self.current.tags != self.pending.tags) arrange_output = true;
 
     // If switching from float -> layout or layout -> float arrange the output
-    // to get assigned a new size or fill the hole in the layout left behind
-    if (self.current.float != self.pending.float)
+    // to get assigned a new size or fill the hole in the layout left behind.
+    if (self.current.float != self.pending.float) {
+        assert(!self.pending.fullscreen); // float state modifed while in fullscreen
         arrange_output = true;
+    }
 
-    // If switching from float to non-float, save the dimensions
-    if (self.current.float and !self.pending.float)
-        self.float_box = self.current.box;
+    // If switching from float to non-float, save the dimensions.
+    if (self.current.float and !self.pending.float) self.float_box = self.current.box;
 
-    // If switching from non-float to float, apply the saved float dimensions
-    if (!self.current.float and self.pending.float)
-        self.pending.box = self.float_box;
+    // If switching from non-float to float, apply the saved float dimensions.
+    if (!self.current.float and self.pending.float) self.pending.box = self.float_box;
 
-    // If switching to fullscreen set the dimensions to the full area of the output
-    // and turn the view fully opaque
+    // If switching to fullscreen, set the dimensions to the full area of the output
+    // Since no other views will be visible, we can skip arranging the output.
     if (!self.current.fullscreen and self.pending.fullscreen) {
         self.setFullscreen(true);
         self.post_fullscreen_box = self.current.box;
-
-        self.pending.target_opacity = 1.0;
-        const layout_box = server.root.output_layout.getBox(self.output.wlr_output).?;
+        const dimensions = self.output.getEffectiveResolution();
         self.pending.box = .{
             .x = 0,
             .y = 0,
-            .width = @intCast(u32, layout_box.width),
-            .height = @intCast(u32, layout_box.height),
+            .width = dimensions.width,
+            .height = dimensions.height,
         };
     }
 
     if (self.current.fullscreen and !self.pending.fullscreen) {
         self.setFullscreen(false);
         self.pending.box = self.post_fullscreen_box;
-
-        // Restore configured opacity
-        self.pending.target_opacity = if (self.pending.focus > 0)
-            server.config.opacity.focused
-        else
-            server.config.opacity.unfocused;
+        // If switching from fullscreen to layout, we need to arrange the output.
+        if (!self.pending.float) arrange_output = true;
     }
 
     if (arrange_output) self.output.arrangeViews();
@@ -265,9 +240,9 @@ pub fn dropSavedBuffers(self: *Self) void {
 }
 
 pub fn saveBuffers(self: *Self) void {
-    std.debug.assert(self.saved_buffers.items.len == 0);
+    assert(self.saved_buffers.items.len == 0);
     self.saved_surface_box = self.surface_box;
-    self.surface.?.forEachSurface(*std.ArrayList(SavedBuffer), saveBuffersIterator, &self.saved_buffers);
+    self.forEachSurface(*std.ArrayList(SavedBuffer), saveBuffersIterator, &self.saved_buffers);
 }
 
 fn saveBuffersIterator(
@@ -345,15 +320,21 @@ pub fn setResizing(self: Self, resizing: bool) void {
     }
 }
 
-pub inline fn forEachPopupSurface(
+/// Iterates over all surfaces, subsurfaces, and popups in the tree
+pub inline fn forEachSurface(
     self: Self,
     comptime T: type,
     iterator: fn (surface: *wlr.Surface, sx: c_int, sy: c_int, data: T) callconv(.C) void,
     user_data: T,
 ) void {
     switch (self.impl) {
-        .xdg_toplevel => |xdg_toplevel| xdg_toplevel.forEachPopupSurface(T, iterator, user_data),
-        .xwayland_view => {},
+        .xdg_toplevel => |xdg_toplevel| {
+            xdg_toplevel.xdg_surface.forEachSurface(T, iterator, user_data);
+        },
+        .xwayland_view => {
+            assert(build_options.xwayland);
+            self.surface.?.forEachSurface(T, iterator, user_data);
+        },
     }
 }
 
@@ -449,8 +430,6 @@ pub fn shouldTrackConfigure(self: Self) bool {
 
 /// Called by the impl when the surface is ready to be displayed
 pub fn map(self: *Self) void {
-    self.pending.target_opacity = server.config.opacity.unfocused;
-
     log.debug("view '{s}' mapped", .{self.getTitle()});
 
     if (self.foreign_toplevel_handle == null) {
@@ -499,10 +478,6 @@ pub fn unmap(self: *Self) void {
 
     if (self.saved_buffers.items.len == 0) self.saveBuffers();
 
-    if (self.opacity_timer != null) {
-        self.killOpacityTimer();
-    }
-
     // Inform all seats that the view has been unmapped so they can handle focus
     var it = server.input_manager.seats.first;
     while (it) |node| : (it = node.next) {
@@ -537,69 +512,6 @@ pub fn notifyTitle(self: Self) void {
 pub fn notifyAppId(self: Self) void {
     if (self.foreign_toplevel_handle) |handle| {
         if (self.getAppId()) |s| handle.setAppId(s);
-    }
-}
-
-/// Change the opacity of a view by config.opacity.delta.
-/// If the target opacity was reached, return true.
-fn incrementOpacity(self: *Self) bool {
-    self.output.damage.addWhole();
-    if (self.opacity < self.current.target_opacity) {
-        self.opacity += server.config.opacity.delta;
-        if (self.opacity < self.current.target_opacity) return false;
-    } else {
-        self.opacity -= server.config.opacity.delta;
-        if (self.opacity > self.current.target_opacity) return false;
-    }
-    self.opacity = self.current.target_opacity;
-    return true;
-}
-
-/// Destroy a views opacity timer
-fn killOpacityTimer(self: *Self) void {
-    self.opacity_timer.?.remove();
-    self.opacity_timer = null;
-}
-
-/// Set the timeout on a views opacity timer
-fn armOpacityTimer(self: *Self) void {
-    const delta_t = server.config.opacity.delta_t;
-    self.opacity_timer.?.timerUpdate(delta_t) catch |err| {
-        log.err("failed to update opacity timer: {s}", .{err});
-        self.killOpacityTimer();
-    };
-}
-
-/// Called by the opacity timer
-fn handleOpacityTimer(self: *Self) callconv(.C) c_int {
-    if (self.incrementOpacity()) {
-        self.killOpacityTimer();
-    } else {
-        self.armOpacityTimer();
-    }
-    return 0;
-}
-
-/// Create an opacity timer for a view and arm it
-fn attachOpacityTimer(self: *Self) void {
-    const event_loop = server.wl_server.getEventLoop();
-    self.opacity_timer = event_loop.addTimer(*Self, handleOpacityTimer, self) catch {
-        log.err("failed to create opacity timer for view '{s}'", .{self.getTitle()});
-        return;
-    };
-    self.armOpacityTimer();
-}
-
-/// Commit an opacity transition
-pub fn commitOpacityTransition(self: *Self) void {
-    if (self.opacity == self.current.target_opacity) return;
-
-    // A running timer can handle a target_opacity change
-    if (self.opacity_timer != null) return;
-
-    // Do the first step now, if that step was not enough, attach timer
-    if (!self.incrementOpacity()) {
-        self.attachOpacityTimer();
     }
 }
 

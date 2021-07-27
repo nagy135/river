@@ -39,19 +39,20 @@
 const std = @import("std");
 const mem = std.mem;
 const math = std.math;
+const os = std.os;
 const assert = std.debug.assert;
 
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const river = wayland.client.river;
 
-const Args = @import("args.zig").Args;
-const FlagDef = @import("args.zig").FlagDef;
+const flags = @import("flags");
 
 const usage =
-    \\Usage: rivertile [options]
+    \\usage: rivertile [options]
     \\
-    \\  -h, --help      Print this help message and exit.
+    \\  -help           Print this help message and exit.
+    \\  -version        Print the version number and exit.
     \\  -view-padding   Set the padding around views in pixels. (Default 6)
     \\  -outer-padding  Set the padding around the edge of the layout area in
     \\                  pixels. (Default 6)
@@ -59,10 +60,16 @@ const usage =
     \\                  layout. (Default left)
     \\  -main-count     Set the initial number of views in the main area of the
     \\                  layout. (Default 1)
-    \\  -main-factor    Set the initial ratio of main area to total layout
+    \\  -main-ratio     Set the initial ratio of main area to total layout
     \\                  area. (Default: 0.6)
     \\
 ;
+
+const Command = enum {
+    @"main-location",
+    @"main-count",
+    @"main-ratio",
+};
 
 const Location = enum {
     top,
@@ -76,14 +83,14 @@ var view_padding: u32 = 6;
 var outer_padding: u32 = 6;
 var default_main_location: Location = .left;
 var default_main_count: u32 = 1;
-var default_main_factor: f64 = 0.6;
+var default_main_ratio: f64 = 0.6;
 
 /// We don't free resources on exit, only when output globals are removed.
 const gpa = std.heap.c_allocator;
 
 const Context = struct {
     initialized: bool = false,
-    layout_manager: ?*river.LayoutManagerV2 = null,
+    layout_manager: ?*river.LayoutManagerV3 = null,
     outputs: std.TailQueue(Output) = .{},
 
     fn addOutput(context: *Context, registry: *wl.Registry, name: u32) !void {
@@ -102,9 +109,9 @@ const Output = struct {
 
     main_location: Location,
     main_count: u32,
-    main_factor: f64,
+    main_ratio: f64,
 
-    layout: *river.LayoutV2 = undefined,
+    layout: *river.LayoutV3 = undefined,
 
     fn init(output: *Output, context: *Context, wl_output: *wl.Output, name: u32) !void {
         output.* = .{
@@ -112,7 +119,7 @@ const Output = struct {
             .name = name,
             .main_location = default_main_location,
             .main_count = default_main_count,
-            .main_factor = default_main_factor,
+            .main_ratio = default_main_ratio,
         };
         if (context.initialized) try output.getLayout(context);
     }
@@ -128,39 +135,65 @@ const Output = struct {
         output.layout.destroy();
     }
 
-    fn layoutListener(layout: *river.LayoutV2, event: river.LayoutV2.Event, output: *Output) void {
+    fn layoutListener(layout: *river.LayoutV3, event: river.LayoutV3.Event, output: *Output) void {
         switch (event) {
             .namespace_in_use => fatal("namespace 'rivertile' already in use.", .{}),
 
-            .set_int_value => |ev| {
-                if (mem.eql(u8, mem.span(ev.name), "main_count")) {
-                    if (ev.value > 0) output.main_count = @intCast(u32, ev.value);
+            .user_command => |ev| {
+                var it = mem.tokenize(mem.span(ev.command), " ");
+                const raw_cmd = it.next() orelse {
+                    std.log.err("not enough arguments", .{});
+                    return;
+                };
+                const raw_arg = it.next() orelse {
+                    std.log.err("not enough arguments", .{});
+                    return;
+                };
+                if (it.next() != null) {
+                    std.log.err("too many arguments", .{});
+                    return;
                 }
-            },
-            .mod_int_value => |ev| {
-                if (mem.eql(u8, mem.span(ev.name), "main_count")) {
-                    const result = @as(i33, output.main_count) + ev.delta;
-                    if (result > 0) output.main_count = @intCast(u32, result);
-                }
-            },
-
-            .set_fixed_value => |ev| {
-                if (mem.eql(u8, mem.span(ev.name), "main_factor")) {
-                    output.main_factor = math.clamp(ev.value.toDouble(), 0.1, 0.9);
-                }
-            },
-            .mod_fixed_value => |ev| {
-                if (mem.eql(u8, mem.span(ev.name), "main_factor")) {
-                    const new_value = ev.delta.toDouble() + output.main_factor;
-                    output.main_factor = math.clamp(new_value, 0.1, 0.9);
-                }
-            },
-
-            .set_string_value => |ev| {
-                if (mem.eql(u8, mem.span(ev.name), "main_location")) {
-                    if (std.meta.stringToEnum(Location, mem.span(ev.value))) |new_location| {
-                        output.main_location = new_location;
-                    }
+                const cmd = std.meta.stringToEnum(Command, raw_cmd) orelse {
+                    std.log.err("unknown command: {s}", .{raw_cmd});
+                    return;
+                };
+                switch (cmd) {
+                    .@"main-location" => {
+                        output.main_location = std.meta.stringToEnum(Location, raw_arg) orelse {
+                            std.log.err("unknown location: {s}", .{raw_arg});
+                            return;
+                        };
+                    },
+                    .@"main-count" => {
+                        const arg = std.fmt.parseInt(i32, raw_arg, 10) catch |err| {
+                            std.log.err("failed to parse argument: {}", .{err});
+                            return;
+                        };
+                        switch (raw_arg[0]) {
+                            '+' => output.main_count = math.add(
+                                u32,
+                                output.main_count,
+                                @intCast(u32, arg),
+                            ) catch math.maxInt(u32),
+                            '-' => {
+                                const result = @as(i33, output.main_count) + arg;
+                                if (result >= 0) output.main_count = @intCast(u32, result);
+                            },
+                            else => output.main_count = @intCast(u32, arg),
+                        }
+                    },
+                    .@"main-ratio" => {
+                        const arg = std.fmt.parseFloat(f64, raw_arg) catch |err| {
+                            std.log.err("failed to parse argument: {}", .{err});
+                            return;
+                        };
+                        switch (raw_arg[0]) {
+                            '+', '-' => {
+                                output.main_ratio = math.clamp(output.main_ratio + arg, 0.1, 0.9);
+                            },
+                            else => output.main_ratio = math.clamp(arg, 0.1, 0.9),
+                        }
+                    },
                 }
             },
 
@@ -191,7 +224,7 @@ const Output = struct {
                 var secondary_height_rem: u32 = undefined;
 
                 if (main_count > 0 and secondary_count > 0) {
-                    main_width = @floatToInt(u32, output.main_factor * @intToFloat(f64, usable_width));
+                    main_width = @floatToInt(u32, output.main_ratio * @intToFloat(f64, usable_width));
                     main_height = usable_height / main_count;
                     main_height_rem = usable_height % main_count;
 
@@ -236,86 +269,96 @@ const Output = struct {
 
                     switch (output.main_location) {
                         .left => layout.pushViewDimensions(
-                            ev.serial,
                             x + @intCast(i32, outer_padding),
                             y + @intCast(i32, outer_padding),
                             width,
                             height,
+                            ev.serial,
                         ),
                         .right => layout.pushViewDimensions(
-                            ev.serial,
                             @intCast(i32, usable_width - width) - x + @intCast(i32, outer_padding),
                             y + @intCast(i32, outer_padding),
                             width,
                             height,
+                            ev.serial,
                         ),
                         .top => layout.pushViewDimensions(
-                            ev.serial,
                             y + @intCast(i32, outer_padding),
                             x + @intCast(i32, outer_padding),
                             height,
                             width,
+                            ev.serial,
                         ),
                         .bottom => layout.pushViewDimensions(
-                            ev.serial,
                             y + @intCast(i32, outer_padding),
                             @intCast(i32, usable_width - width) - x + @intCast(i32, outer_padding),
                             height,
                             width,
+                            ev.serial,
                         ),
                     }
                 }
 
-                layout.commit(ev.serial);
+                switch (output.main_location) {
+                    .left => layout.commit("rivertile - left", ev.serial),
+                    .right => layout.commit("rivertile - right", ev.serial),
+                    .top => layout.commit("rivertile - top", ev.serial),
+                    .bottom => layout.commit("rivertile - bottom", ev.serial),
+                }
             },
-
-            .advertise_view => {},
-            .advertise_done => {},
         }
     }
 };
 
 pub fn main() !void {
     // https://github.com/ziglang/zig/issues/7807
-    const argv: [][*:0]const u8 = std.os.argv;
-    const args = Args(0, &[_]FlagDef{
-        .{ .name = "-h", .kind = .boolean },
-        .{ .name = "--help", .kind = .boolean },
+    const argv: [][*:0]const u8 = os.argv;
+    const result = flags.parse(argv[1..], &[_]flags.Flag{
+        .{ .name = "-help", .kind = .boolean },
+        .{ .name = "-version", .kind = .boolean },
         .{ .name = "-view-padding", .kind = .arg },
         .{ .name = "-outer-padding", .kind = .arg },
         .{ .name = "-main-location", .kind = .arg },
         .{ .name = "-main-count", .kind = .arg },
-        .{ .name = "-main-factor", .kind = .arg },
-    }).parse(argv[1..]);
-
-    if (args.boolFlag("-h") or args.boolFlag("--help")) {
+        .{ .name = "-main-ratio", .kind = .arg },
+    }) catch {
+        try std.io.getStdErr().writeAll(usage);
+        os.exit(1);
+    };
+    if (result.boolFlag("-help")) {
         try std.io.getStdOut().writeAll(usage);
-        std.os.exit(0);
+        os.exit(0);
     }
-    if (args.argFlag("-view-padding")) |raw| {
+    if (result.args.len != 0) fatalPrintUsage("unknown option '{s}'", .{result.args[0]});
+
+    if (result.boolFlag("-version")) {
+        try std.io.getStdOut().writeAll(@import("build_options").version);
+        os.exit(0);
+    }
+    if (result.argFlag("-view-padding")) |raw| {
         view_padding = std.fmt.parseUnsigned(u32, mem.span(raw), 10) catch
-            fatal("invalid value '{s}' provided to -view-padding", .{raw});
+            fatalPrintUsage("invalid value '{s}' provided to -view-padding", .{raw});
     }
-    if (args.argFlag("-outer-padding")) |raw| {
+    if (result.argFlag("-outer-padding")) |raw| {
         outer_padding = std.fmt.parseUnsigned(u32, mem.span(raw), 10) catch
-            fatal("invalid value '{s}' provided to -outer-padding", .{raw});
+            fatalPrintUsage("invalid value '{s}' provided to -outer-padding", .{raw});
     }
-    if (args.argFlag("-main-location")) |raw| {
+    if (result.argFlag("-main-location")) |raw| {
         default_main_location = std.meta.stringToEnum(Location, mem.span(raw)) orelse
-            fatal("invalid value '{s}' provided to -main-location", .{raw});
+            fatalPrintUsage("invalid value '{s}' provided to -main-location", .{raw});
     }
-    if (args.argFlag("-main-count")) |raw| {
+    if (result.argFlag("-main-count")) |raw| {
         default_main_count = std.fmt.parseUnsigned(u32, mem.span(raw), 10) catch
-            fatal("invalid value '{s}' provided to -main-count", .{raw});
+            fatalPrintUsage("invalid value '{s}' provided to -main-count", .{raw});
     }
-    if (args.argFlag("-main-factor")) |raw| {
-        default_main_factor = std.fmt.parseFloat(f64, mem.span(raw)) catch
-            fatal("invalid value '{s}' provided to -main-factor", .{raw});
+    if (result.argFlag("-main-ratio")) |raw| {
+        default_main_ratio = std.fmt.parseFloat(f64, mem.span(raw)) catch
+            fatalPrintUsage("invalid value '{s}' provided to -main-ratio", .{raw});
     }
 
     const display = wl.Display.connect(null) catch {
         std.debug.warn("Unable to connect to Wayland server.\n", .{});
-        std.os.exit(1);
+        os.exit(1);
     };
     defer display.disconnect();
 
@@ -326,7 +369,7 @@ pub fn main() !void {
     _ = try display.roundtrip();
 
     if (context.layout_manager == null) {
-        fatal("wayland compositor does not support river-layout-v2.\n", .{});
+        fatal("wayland compositor does not support river-layout-v3.\n", .{});
     }
 
     context.initialized = true;
@@ -343,8 +386,8 @@ pub fn main() !void {
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, context: *Context) void {
     switch (event) {
         .global => |global| {
-            if (std.cstr.cmp(global.interface, river.LayoutManagerV2.getInterface().name) == 0) {
-                context.layout_manager = registry.bind(global.name, river.LayoutManagerV2, 1) catch return;
+            if (std.cstr.cmp(global.interface, river.LayoutManagerV3.getInterface().name) == 0) {
+                context.layout_manager = registry.bind(global.name, river.LayoutManagerV3, 1) catch return;
             } else if (std.cstr.cmp(global.interface, wl.Output.getInterface().name) == 0) {
                 context.addOutput(registry, global.name) catch |err| fatal("failed to bind output: {}", .{err});
             }
@@ -364,8 +407,13 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, context: *
     }
 }
 
-pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
-    const stderr = std.io.getStdErr().writer();
-    stderr.print("err: " ++ format ++ "\n", args) catch {};
-    std.os.exit(1);
+fn fatal(comptime format: []const u8, args: anytype) noreturn {
+    std.log.err(format, args);
+    os.exit(1);
+}
+
+fn fatalPrintUsage(comptime format: []const u8, args: anytype) noreturn {
+    std.log.err(format, args);
+    std.io.getStdErr().writeAll(usage) catch {};
+    os.exit(1);
 }
